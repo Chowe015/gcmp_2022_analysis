@@ -1,0 +1,1031 @@
+---
+title: " Geo-Bon Conference Data Analysis for Global Coral Microbiome Project: Australia, Hawaii, Colombia and Panama"
+authors: "Colin Howe"
+date: "10/05/2023"
+output: html_document
+---
+
+# First, Set working Directory load library and Import Data into Phyloseq
+```{r warning=FALSE}
+# Command for setting your work directory
+setwd("C:/Users/Colin Howe/Desktop/PSU Doctoral Program/GCMP_Working/gcmp_qiime_input")
+
+# Print your working directory
+
+getwd()
+#
+```
+
+## Load required libraries. 
+```{r, message=FALSE, warning=FALSE} 
+library(BiocManager)
+library(phyloseq)
+library(dplyr)
+library(qiime2R)
+library(DESeq2)
+library(ComplexHeatmap)
+library(ade4)
+library(vegan)
+library(RColorBrewer)
+library(tidyverse)
+library(ggplot2)
+library(microbiome)
+library(dendextend)
+library(gplots)
+library(ggrepel)
+library(tidyr)
+library(ggpubr)
+library(cowplot)
+library(RVAideMemoire)
+library(ape)
+library(microbiomeMarker)
+```
+
+# Let's cleaning the taxa file!
+```{r}
+##Creating require files for phyloseq
+#### Create ASV and taxonomy from qza tables importing as a matrix
+
+#simple import from qza to phyloseq
+asv <- qza_to_phyloseq(features = "gcmp_qiime_input/filtered_merged_table_v2.qza")
+
+#### Import Metadata read.table
+metadata <- read.table(file = "gcmp_qiime_input/geo_bon_mapping.csv",header=T,comment.char="", row.names=1, sep=",")
+
+### Import Tree file from biom output tree.nwk
+tree2 <- read_tree("gcmp_qiime_input/tree.nwk")
+
+### Import taxonomy * read.table
+#taxonomy2 <- qza_to_phyloseq(taxonomy = "qiime_results/rush_taxonomy.qza")
+taxonomy <- read.table(file = "gcmp_qiime_input/taxonomy.tsv", sep = "\t", header = T ,row.names = 1)
+
+# clean the taxonomy
+##code referenced from Yan Hui: email me@yanh.org github: yanhui09
+
+tax <- taxonomy %>%
+  select(Taxon) %>% 
+  separate(Taxon, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), "; ")
+
+tax.clean <- data.frame(row.names = row.names(tax),
+                        Kingdom = str_replace(tax[,1], "k__",""),
+                        Phylum = str_replace(tax[,2], "p__",""),
+                        Class = str_replace(tax[,3], "c__",""),
+                        Order = str_replace(tax[,4], "o__",""),
+                        Family = str_replace(tax[,5], "f__",""),
+                        Genus = str_replace(tax[,6], "g__",""),
+                        Species = str_replace(tax[,7], "s__",""),
+                        stringsAsFactors = FALSE)
+
+tax.clean[is.na(tax.clean)] <- ""
+tax.clean[tax.clean=="__"] <- ""
+
+for (i in 1:nrow(tax.clean)){
+  if (tax.clean[i,7] != ""){
+    tax.clean$Species[i] <- paste(tax.clean$Genus[i], tax.clean$Species[i], sep = " ")
+  } else if (tax.clean[i,2] == ""){
+    kingdom <- paste("Unclassified", tax.clean[i,1], sep = " ")
+    tax.clean[i, 2:7] <- kingdom
+  } else if (tax.clean[i,3] == ""){
+    phylum <- paste("Unclassified", tax.clean[i,2], sep = " ")
+    tax.clean[i, 3:7] <- phylum
+  } else if (tax.clean[i,4] == ""){
+    class <- paste("Unclassified", tax.clean[i,3], sep = " ")
+    tax.clean[i, 4:7] <- class
+  } else if (tax.clean[i,5] == ""){
+    order <- paste("Unclassified", tax.clean[i,4], sep = " ")
+    tax.clean[i, 5:7] <- order
+  } else if (tax.clean[i,6] == ""){
+    family <- paste("Unclassified", tax.clean[i,5], sep = " ")
+    tax.clean[i, 6:7] <- family
+  } else if (tax.clean[i,7] == ""){
+    tax.clean$Species[i] <- paste("Unclassified ",tax.clean$Genus[i], sep = " ")
+  }
+}
+
+
+OTU <- otu_table(as.matrix(asv), taxa_are_rows = TRUE)
+tax1 = tax_table(as.matrix(tax.clean))
+SAMPLE <- sample_data(metadata)
+TREE = read_tree(tree2)
+
+ch_phylo <- phyloseq(OTU,tax1,SAMPLE,TREE)
+
+
+#nsamples(ch_phylo)
+#sample_data(ch_phylo)
+#sample_variables(ch_phylo)
+#sample_names(ch_phylo)
+
+```
+
+## Clean up not target sequences the dataset 
+```{r, message=FALSE, warning=FALSE}
+library(gridExtra)
+# Remove features that have only been classified at the kingdom level
+
+phylo_noNA <- subset_taxa(ch_phylo,Phylum != "NA", Order!= "Chloroplast" & Family != "Mitochondria" & Order !="Unclassified bacteroidia")
+
+## Let's see how our data have changed as a result
+
+
+# Remove any samples with less than 1 read
+phylo_coral = prune_samples(sample_sums(phylo_noNA)>=1, phylo_noNA)
+phylo_coral
+
+## After we now have 583 unique bacterial and archaea families
+#phylo_nclass = subset_taxa(phylo_nclass, Family !="Unclassified Proteobacteria")
+
+##Rarefication
+set.seed(111) # keep result reproductive
+gcmp.rarefied = rarefy_even_depth(phylo_coral, rngseed=1, sample.size=1000, replace=T) ## After looking up rarefy_ command the notes advise against using this command. Instead they suggest phyloseq_to_deseq2 command for linear mixed effects models. 
+gcmp.rarefied
+#get_taxa_unique(phylo_nlow, "Family")
+
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(phylo_coral),
+               MARGIN = ifelse(taxa_are_rows(phylo_coral), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+#Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(phylo_coral),
+                    tax_table(phylo_coral))
+#Compute the total and average prevalences of the features in each phylum(Family)
+coral_family_prev <-plyr::ddply(prevdf, "Family", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+
+## After looking at the dataframe I noticed there are several ASV that have 0 prevalence and 0 abundance. I filtered these out as well. 0.05 represents 5% of the dataset. However this contains on 13 families. Instead I used 0.5% and it returned 202 Asv families. Additionally any prevalence under 0.05 filters a majority of taxa found. from 17k to 1k
+#phylo_prev = 0.005* nsamples(phylo_coral)
+#keepTaxa = rownames(prevdf)[(prevdf$Prevalence >= phylo_prev)]
+#phylo_nlow_prev = prune_taxa(keepTaxa, phylo_coral)
+
+## Check Results
+#get_taxa_unique(phylo_nlow1, "Family")
+#get_taxa_unique(phylo_nlow_prev, "Family")
+
+#multiPlotTitleTextSize = 15
+#p2tree = plot_tree(phylo_nlow, method = "treeonly",
+#                   ladderize = "left",
+#                   title = "Taxa Count = 1") +
+#  theme(plot.title = element_text(size = multiPlotTitleTextSize))
+#p3tree = plot_tree(phylo_nclass, method = "treeonly",
+#                   ladderize = "left", title = "Unclassified Bacteria \n & Archaea") +
+#  theme(plot.title = element_text(size = multiPlotTitleTextSize))
+#p4tree = plot_tree(phylo_nlow_prev, method = "treeonly",
+#                   ladderize = "left", title = "Minimum Prevelence \n of 0.1%") +
+#  theme(plot.title = element_text(size = multiPlotTitleTextSize))
+#p5tree = plot_tree(ps.rarefied, method = "treeonly",
+#                   ladderize = "left", title = "Rarefied to\n 2000 taxa") +
+#  theme(plot.title = element_text(size = multiPlotTitleTextSize))
+#
+#grid.arrange(nrow = 1, p2tree, p3tree, p4tree, p5tree)
+
+
+#phylo_nlow
+#phylo_nclass
+#phylo_nlow_prev
+#ps.rarefied
+## Rarefied dataset contains 553 families compared to 583. (30 families lost) 
+#get_taxa_unique(ps.rarefied, "Family")
+
+
+```
+
+### Subset Phyloseq Objects for Comparative Analysis 
+```{r}
+### Subsets with All samples with some that exclude out-groups and expeditions
+main_coral <- subset_samples(gcmp.rarefied, country_group == "yes"& Biological_group == "yes" & family_group =="yes") # All with outgroups millepora and stylerasteridae 
+
+##Sub_sample Corals with no outgroup
+coral <-subset_samples(main_coral, coral_group == "yes") #corals without outgroups and environmental samples 
+
+## Compartments * No need to make distance matrix for these subsets
+#Mucus Subset
+mucus <-subset_samples(coral,BiologicalMatter == "Coral Mucus")
+#Tissue Subset
+tissue <-subset_samples(coral,BiologicalMatter == "Coral Tissue")
+#Skeleton Subset
+skeleton <-subset_samples(coral,BiologicalMatter == "Coral Skeleton")
+
+#Phylo_complex Comparison across Compartments
+mucus_complex <-subset_samples(coral,BiologicalMatter == "Coral Mucus" & phylo_complex == "yes")
+#Tissue Subset
+tissue_complex <-subset_samples(coral,BiologicalMatter == "Coral Tissue" & phylo_complex == "yes")
+#Skeleton Subset
+skeleton_complex <-subset_samples(coral,BiologicalMatter == "Coral Skeleton" & phylo_complex == "yes")
+
+#Phylo_robust Comparison across Compartments
+mucus_robust <-subset_samples(coral,BiologicalMatter == "Coral Mucus" & phylo_robust == "yes")
+#Tissue Subset
+tissue_robust <-subset_samples(coral,BiologicalMatter == "Coral Tissue" & phylo_robust == "yes")
+#Skeleton Subset
+skeleton_robust <-subset_samples(coral,BiologicalMatter == "Coral Skeleton" & phylo_robust == "yes")
+
+#robust_group_mucus
+meru_muc <-subset_samples(mucus, family == "Merulinidae")
+poci_muc <-subset_samples(mucus,family == "Pocilloporidae")
+dipl_muc <-subset_samples(mucus,family == "Diploastreidae")
+#robust_group_tissue
+meru_tis <-subset_samples(tissue, family == "Merulinidae")
+poci_tis <-subset_samples(tissue,family == "Pocilloporidae")
+dipl_tis <-subset_samples(tissue,family == "Diploastreidae")
+#robust_group_skeleton
+meru_ske <-subset_samples(skeleton, family == "Merulinidae")
+poci_ske <-subset_samples(skeleton,family == "Pocilloporidae")
+dipl_ske <-subset_samples(skeleton,family == "Diploastreidae")
+
+#complex_group_mucus
+acro_muc <-subset_samples(mucus, family == "Acroporidae")
+por_muc <-subset_samples(mucus, family == "Poritidae")
+agra_muc <-subset_samples(mucus, family == "Agariciidae")
+#dendro <-subset_samples(main_coral,family == "Dendrophylliidae")
+
+#complex_group_tissue
+acro_tis <-subset_samples(tissue, family == "Acroporidae")
+por_tis <-subset_samples(tissue, family == "Poritidae")
+agra_tis <-subset_samples(tissue, family == "Agariciidae")
+#dendro <-subset_samples(main_coral,family == "Dendrophylliidae")
+
+#complex_group_skeleton
+acro_ske <-subset_samples(skeleton, family == "Acroporidae")
+por_ske <-subset_samples(skeleton, family == "Poritidae")
+agra_ske <-subset_samples(skeleton, family == "Agariciidae")
+#dendro <-subset_samples(main_coral,family == "Dendrophylliidae")
+
+
+
+
+#### Dataframes for PERMANOVA and Pairwise Analysis #################
+coral_mc_df <-data.frame(sample_data(main_coral))
+coral_df <- data.frame(sample_data(coral))
+
+#compartments
+mus_df <- data.frame(sample_data(mucus))
+tis_df <- data.frame(sample_data(tissue))
+ske_df <- data.frame(sample_data(skeleton))
+
+#Robust Family 
+meru_df <- data.frame(sample_data(meru))
+lobo_df <- data.frame(sample_data(lobo))
+poci_df <- data.frame(sample_data(poci))
+dipl <- data.frame(sample_data(dipl))
+## Complex Family
+acro_df <- data.frame(sample_data(acro))
+por_df <- data.frame(sample_data(por))
+agra_df <- data.frame(sample_data(agra))
+dendro_df <- data.frame(sample_data(dendro))
+
+#Environmental Comparisons
+# subset taxa 
+#endo <- subset_taxa(coral, Family == "Endozoicomonadaceae") ## 536 asv
+#rhodo <- subset_taxa(coral, Family == "Rhodobacteraceae") ## 1348 asv
+#vibrio <- subset_taxa(coral, Family == "Vibrionaceae") ## 486 asv
+
+```
+
+### Phyloseq Metadata Query
+```{r}
+## To obtain metadata from subset samples 
+ meru_metadata <-(sample_data(meru))
+view(meru_metadata)
+
+# Total number of sequences
+print("total")
+
+sum(sample_sums(ch_phylo))
+ch_phylo
+# Min number of sequences in a sample
+print("min")
+min(sample_sums(ch_phylo))
+
+# Mean number of sequences
+print("mean")
+mean(sample_sums(ch_phylo))
+
+# Median number of sequences
+print("median")
+median(sample_sums(ch_phylo))
+
+# Max number of sequences
+print("max")
+max(sample_sums(ch_phylo))
+
+# Total number of ASVs
+ntaxa(ch_phylo)
+
+```
+
+# DISTANCE MATRICES
+```{r}
+
+##Distance matrix for complex_Family_Compartment
+bray_acro_muc = phyloseq::distance(acro_muc, method="bray")
+bray_acro_tis = phyloseq::distance(acro_tis, method="bray")
+bray_acro_ske = phyloseq::distance(acro_ske, method="bray")
+uni_acro_tis = phyloseq::distance(acro_tis, method="unifrac")
+
+##Distance matrix for complex_Family_Compartment
+bray_agra_muc = phyloseq::distance(agra_muc, method="bray")
+bray_agra_tis = phyloseq::distance(agra_tis, method="bray")
+bray_agra_ske = phyloseq::distance(agra_ske, method="bray")
+uni_agra_tis = phyloseq::distance(agra_tis, method="unifrac")
+
+##Distance matrix for Robust_Family_Compartment
+bray_meru_muc = phyloseq::distance(meru_muc, method="bray")
+bray_meru_tis = phyloseq::distance(meru_tis, method="bray")
+bray_meru_ske = phyloseq::distance(meru_ske, method="bray")
+uni_meru_tis = phyloseq::distance(meru_tis, method="unifrac")
+
+##Distance matrix for Robust_Family_Compartment
+bray_poci_muc = phyloseq::distance(poci_muc, method="bray")
+bray_poci_tis = phyloseq::distance(poci_tis, method="bray")
+bray_poci_ske = phyloseq::distance(poci_ske, method="bray")
+uni_poci_tis = phyloseq::distance(poci_tis, method="unifrac")
+
+
+##Distance matrix for Complex Mucus
+bray_mucus_complex = phyloseq::distance(mucus_complex, method="bray")
+uni_mucus_complex = phyloseq::distance(mucus_complex, method="unifrac")
+wuni_mucus_complex = phyloseq::distance(mucus_complex, method="wUnifrac", )
+
+##Distance matrix for Complex Tissue
+bray_tissue_complex = phyloseq::distance(tissue_complex, method="bray")
+uni_tissue_complex = phyloseq::distance(tissue_complex, method="unifrac")
+wuni_tissue_complex = phyloseq::distance(tissue_complex, method="wUnifrac", )
+
+##Distance matrix for Complex Skeleton
+bray_skeleton_complex = phyloseq::distance(skeleton_complex, method="bray")
+uni_skeleton_complex = phyloseq::distance(skeleton_complex, method="unifrac")
+wuni_skeleton_complex = phyloseq::distance(skeleton_complex, method="wUnifrac", )
+
+##Distance matrix for Robust mucus
+bray_mucus_robust = phyloseq::distance(mucus_robust, method="bray")
+uni_mucus_robust = phyloseq::distance(mucus_robust, method="unifrac")
+wuni_mucus_robust = phyloseq::distance(mucus_robust, method="wUnifrac", )
+
+##Distance matrix for Robust Tissue
+bray_tissue_robust = phyloseq::distance(tissue_robust, method="bray")
+uni_tissue_robust = phyloseq::distance(tissue_robust, method="unifrac")
+wuni_tissue_robust = phyloseq::distance(tissue_robust, method="wUnifrac", )
+
+##Distance matrix for Robust Skeleton
+bray_skeleton_robust = phyloseq::distance(skeleton_robust, method="bray")
+uni_skeleton_robust = phyloseq::distance(skeleton_robust, method="unifrac")
+wuni_skeleton_robust = phyloseq::distance(skeleton_robust, method="wUnifrac", )
+
+
+
+## Coral 
+#bray_coral = phyloseq::distance(coral, method = "bray")
+##wuni_coral = phyloseq::distance(coral, method = "Wunifrac")
+coral_df <- data.frame(sample_data(coral))
+
+
+```
+
+# Ordination from Distance Matrix and plot PCoA 
+```{r}
+# Sub_sample within Robust Corals Rhodobacteraceae, Vibrionaceae, Endozoicomonadaceae
+#Mucus Subset
+mucus_com <-subset_samples(coral, BiologicalMatter == "Coral Skeleton" & phylo_robust == "yes")
+
+endo_muc_com <-subset_taxa(mucus_com, Family == "Vibrionaceae")
+#compartments
+mus_muc_com_df <- data.frame(sample_data(mucus_com))
+
+##Distance matrix for Endozoicomonadaceae skeleton
+#bray_endo_muc_com = phyloseq::distance(endo_muc_com, method="bray")
+#uni_endo_muc_com = phyloseq::distance(endo_muc_com, method="unifrac")
+wuni_endo_muc_com = phyloseq::distance(endo_muc_com, method="wUnifrac")
+wuni_endo_muc_com[is.na(wuni_endo_muc_com)] <- 0
+
+# Endo_complex_phlyo_tissue
+bray_endo_tis <- phyloseq::distance(rhodo_ske, method= "bray")
+uni_endo_tis <- phyloseq::distance(rhodo_ske, method= "unifrac")
+wuni_endo_tis <- phyloseq::distance(rhodo_ske, method= "WUnifrac")
+
+endo_tis_df <- data.frame(sample_data(rhodo_ske))
+bray_endo_tis[is.na(bray_endo_tis)] <- 0
+uni_endo_tis[is.na(uni_endo_tis)] <- 0
+
+
+
+##Calculate the PCoA on Complex Corals
+rt.pcoa = ordinate(endo_tis, method="PCoA", distance= wuni_endo_tis)
+# Set variables to zero for subsequent changes
+#Ofra
+wuni_endo_tis[is.na(wuni_endo_tis)] <- 0
+rt.pcoa.na <-na.omit(rt.pcoa)
+pcoa<-0
+pcoa <- plot_ordination(endo_tis, rt.pcoa.na, shape = "family")+  geom_point(size=3) + theme_bw() + theme(plot.title = element_text(hjust = 0.5)) + stat_ellipse(level = 0.95,type = "norm",aes(group=country))+ theme(legend.text=element_text(size=12)) + theme(axis.text=element_text(size=12, face = "bold"), axis.title=element_text(size=14,face="bold") + theme(text = element_text(size = 20,face = "bold"))) # title =expression(paste(italic(" Orbicella spp")," Bray-Curtis Distance PCoA across Depth")) scale_color_manual(values=c("#E31A1C","#1F78B4"))+ 
+print(pcoa)                        
+
+##Calculate the PCoA on Robust Corals
+rt.pcoa1 = ordinate(rhodo_tis, method="PCoA", distance=uni_rhodo_tis)
+pcoa1<-0
+pcoa1 <- plot_ordination(rhodo_tis, rt.pcoa1, shape = "country_region", color="family")+  geom_point(size=3) + theme_bw() + theme(plot.title = element_text(hjust = 0.5)) + stat_ellipse(level = 0.95,type = "norm",aes(group=family))+ theme(legend.text=element_text(size=12)) + theme(axis.text=element_text(size=12, face = "bold"), axis.title=element_text(size=14,face="bold") + theme(text = element_text(size = 20,face = "bold"))) # title =expression(paste(italic(" Orbicella spp")," Bray-Curtis Distance PCoA across Depth")) scale_color_manual(values=c("#E31A1C","#1F78B4"))+
+                        
+##Calculate the PCoA on meru Corals
+rt.pcoa2 = ordinate(endo_tis, method="PCoA", distance=uni_endo_tis)
+pcoa2<-0
+pcoa2 <- plot_ordination(endo_tis, rt.pcoa2, shape = "country_region", color="host_genus") + scale_color_brewer(palette="Paired") + geom_point(size=3) + theme_bw() + theme(plot.title = element_text(hjust = 0.5)) + stat_ellipse(level = 0.95,type = "norm",aes(group=host_genus))+ theme(legend.text=element_text(size=12)) + theme(axis.text=element_text(size=12, face = "bold"), axis.title=element_text(size=14,face="bold") + theme(text = element_text(size = 20,face = "bold"))) # title =expression(paste(italic(" Orbicella spp")," Bray-Curtis Distance PCoA across Depth")) scale_color_manual(values=c("#E31A1C","#1F78B4"))+
+
+##Calculate the PCoA on Pocilloporidae Corals
+rt.pcoa3 = ordinate(poci_ske, method="PCoA", distance=bray_poci_ske)
+pcoa3<-0
+pcoa3 <- plot_ordination(poci_ske, rt.pcoa3, shape = "host_genus", color="country") + geom_point(size=3) + theme_bw() + theme(plot.title = element_text(hjust = 0.5)) + stat_ellipse(level = 0.95,type = "norm",aes(group=country))+ theme(legend.text=element_text(size=12)) + theme(axis.text=element_text(size=12, face = "bold"), axis.title=element_text(size=14,face="bold") + theme(text = element_text(size = 20,face = "bold"))) # title =expression(paste(italic(" Orbicella spp")," Bray-Curtis Distance PCoA across Depth")) scale_color_manual(values=c("#E31A1C","#1F78B4"))+
+
+##Calculate the PCoA on Acroporidae Corals
+rt.pcoa4 = ordinate(acro_tis, method="PCoA", distance=bray_acro_tis)
+pcoa4<-0
+pcoa4 <- plot_ordination(acro_tis, rt.pcoa4, shape = "country_region", color="host_genus")+  geom_point(size=3) + theme_bw() + theme(plot.title = element_text(hjust = 0.5)) + stat_ellipse(level = 0.95,type = "norm",aes(group=host_genus))+ theme(legend.text=element_text(size=12)) + theme(axis.text=element_text(size=12, face = "bold"), axis.title=element_text(size=14,face="bold") + theme(text = element_text(size = 20,face = "bold"))) # title =expression(paste(italic(" Orbicella spp")," Bray-Curtis Distance PCoA across Depth")) scale_color_manual(values=c("#E31A1C","#1F78B4"))+
+
+
+##Calculate the PCoA on Agariciidae Corals
+rt.pcoa5 = ordinate(agra_tis, method="PCoA", distance=uni_agra_tis)
+pcoa5<-0
+pcoa5 <- plot_ordination(agra_tis, rt.pcoa5, shape = "country_region", color="host_genus")+ scale_fill_manual(name=NULL,
+                    values =c("#B2DF8A","#E31A1C","#FB9A99","#6A3D9A")) +  geom_point(size=3) + theme_bw() + theme(plot.title = element_text(hjust = 0.5)) + stat_ellipse(level = 0.95,type = "norm",aes(group=host_genus))+ theme(legend.text=element_text(size=12)) + theme(axis.text=element_text(size=12, face = "bold"), axis.title=element_text(size=14,face="bold") + theme(text = element_text(size = 20,face = "bold"))) # title =expression(paste(italic(" Orbicella spp")," Bray-Curtis Distance PCoA across Depth")) scale_color_manual(values=c("#E31A1C","#1F78B4"))+
+
+```
+
+# Alpha Diversity BoxPlots Compartments & Family
+```{r, boxplots}
+###Once we have our sub_samples rarefied we can start with some diversity analysis  and visualization
+### Alpha Diversity ** you can make multiple diversity box plots by switch x for sample variables
+#install.packages("adespatial")
+#install_github("umerijaz/microbiomeSeq") # Install the package
+
+#library(adespatial)
+#library(microbiomeSeq)  #load the package
+
+# Set up significant bar variables
+a_my_comparisons <- list( c("Coral Mucus", "Coral Skeleton"),c("Coral Mucus", "Coral Tissue"), c("Coral Skeleton", "Coral Tissue")) 
+symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))
+  
+
+alpha_family_mucus <- plot_richness(coral, x="BiologicalMatter", color= "complex_robust", measures = ("Observed"),) +
+  geom_boxplot(width=0.5) + geom_jitter() +  facet_wrap(~complex_robust, scales= "free_x", nrow=1)  + geom_point(na.rm = TRUE) + theme_classic() + theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(size = 12, angle = 0, vjust = 0.1, hjust = 0.5)) + theme(axis.text=element_text(size=12), axis.title=element_text(size=14)) + guides(col="none") +  stat_compare_means(method = "t.test", comparisons = a_my_comparisons, label = "cutpoints", symnum.args = symnum.args) 
+
+# # + scale_color_manual(values=c("#E31A1C","#1F78B4")) title =expression(paste("Shannon Alpha Diversity Across",italic(" Orbicella spp")))+ scale_color_manual(values=c("#FF7F00","#1B9E77"))
+
+
+alpha_family_tissue <- plot_richness(tissue, x="family",color = "complex_robust", title = "Tissue Diversity Across family", color = "family", measures = ("Shannon"),)+
+  geom_boxplot(width=0.8, fill="white")+
+    theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+alpha_family_skeleton <- plot_richness(skeleton, x="family",color = "complex_robust", title = "Skeleton Diversity Across family", color = "family", measures = ("Shannon"),)+
+  geom_boxplot(width=0.8, fill="white")+
+    theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+#all_df$tissue_compartment
+
+complex_diversity_compartment <- plot_richness(complex, x="family", color = "Genus", title = "Merulinidae Diversity Across compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+ 
+robust_diversity_compartment <- plot_richness(robust, x="family",color = "Genus", title = "Alpha Diversity Across Compartment in Panama", measures = ("Shannon"),)+
+  geom_boxplot(width=0.8, fill="white")+
+    theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+acro_diversity_compartment <- plot_richness(acro, x="country", title = "Acroporidae Diversity Across Species Tissue", color = "country",measures = ("Shannon"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+meru_compartment <- plot_richness(meru, x="country", color = "Genus",title = "Merulinidae Diversity Across Species Tissue", color = "country", measures = ("Shannon"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+agra_compartment <- plot_richness(agra, x="country",color = "Genus", title = "Merulinidae Diversity Across Species Tissue", color = "country",measures = ("Shannon"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+poli_compartment <- plot_richness(poci, x="country", color = "Genus",title = "Merulinidae Diversity Across Species Tissue", color = "country",measures = ("Shannon"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+# 
+
+orb_rich = estimate_richness(time2, split = TRUE)
+wilcox.shannon <- pairwise.wilcox.test(orb_rich$Shannon,
+                              sample_data(time2)$treatments)
+```
+
+
+# BAR PLOTS: Coral Compartments
+```{r, message=FALSE, warning=FALSE}
+## Bar Plots Across Family and biological compartment
+phylo_comp <-subset_samples(phylo_coral, coral_group == "yes" & family_group == "yes" & complex_robust == "robust")# & BiologicalMatter == "Coral Skeleton")
+phylo_comp <- subset_taxa(phylo_comp, Order !="Unclassified Bacteroidia")
+# agglomerate taxa
+glom <- tax_glom(phylo_comp, taxrank = 'Order', NArm = TRUE)
+
+# Transform sample counts to proportion out of 100
+ps.all = transform_sample_counts(glom, function(x) x/sum(x)*100)
+ps.melt <- psmelt(ps.all)
+
+# change to character for easy-adjusted level
+ps.melt <- ps.melt %>%
+  group_by(family,BiologicalMatter,host_genus,country_region,Order) %>%
+  mutate(median=median(Abundance)) %>%
+  arrange(desc(median))
+
+# select group median > 1
+keep <- unique(ps.melt$Order[ps.melt$median > 20])
+ps.melt$Order[!(ps.melt$Order %in% keep)] <- "< %2 (Other)"
+
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(family,BiologicalMatter,host_genus,country_region,Order) %>%
+  summarize(Abundance = sum(Abundance), 
+            mean = max(Abundance), .groups = "drop") %>%
+            mutate(Order= factor(Order),
+                   Order= fct_reorder(Order,mean, .desc = TRUE),
+                   Order= fct_shift(Order, n=1))
+
+   
+#, .desc = TRUE 
+# Then Plot Results
+many_col <- c("#A6CEE3", "#33A02C", "#B2DF8A",  "#1F78B4","#E31A1C","#6A3D9A", "#FF7F00","#FDBF6F", "#FB9A99", "#CAB2D6",  "#B15928","#1B9E77", "#D95F02", "#FFFF99","#E7298A", "#7570B3","#666666" ,"#66A61E", "#E6AB02","#A6761D", "#E41A1C", "#377EB8", "#4DAF4A" ,"#984EA3", "#FF7F00","#1B9E77", "#FFFF33", "#A65628", "#F781BF" ,"#D53E4F","#F46D43", "#FDAE61", "#FEE08B","#999999", "#E6F598","#ABDDA4","#3288BD","cyan1","#66C2A5")
+
+testp <-0
+testp <-ggplot(ps.melt_sum, aes(x = family, y = Abundance, fill = Order)) + 
+  geom_bar(stat = "identity", position="fill")  +
+  labs( x=" family", y="Percent Relative Abundance (%)") +  scale_fill_manual(name=NULL, values = c(many_col))  +  facet_wrap(~BiologicalMatter, scales= "free_x", nrow=1) +  
+  theme_classic() + theme(strip.background = element_blank(), axis.text.x.bottom = element_text(angle = 180) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=14,face="bold"), plot.title = element_text(size = 14, face = "bold",hjust = 0.5,),legend.text = element_text(size = 8), legend.box = "vertical") + theme(legend.text = element_text(size=12))+
+                  theme(legend.key.size = unit(.9, 'cm')))  #title =expression(paste(italic(" Oribcella Spp."),"Microbial Community Composition Across Depth ")), + #
+plot(testp)
+
+##################################################################
+## Coral Mucus and Environmental Samples
+
+## Pcoa analysis showed robust tissue structured by site
+## Bar Plots Across Family and biological compartment
+mucus_comp <-subset_samples(coral, complex_robust == "robust" & BiologicalMatter == "Coral Tissue")
+
+ps.all2 = transform_sample_counts(mucus_comp, function(x) x/sum(x)*100)
+
+# agglomerate taxa
+glom2 <- tax_glom(ps.all2, taxrank = 'Order', NArm = TRUE)
+ps.melt2 <- psmelt(glom2)
+
+# change to character for easy-adjusted level
+ps.melt2 <- ps.melt2 %>%
+  group_by(family,BiologicalMatter,host_genus,country_region,Order) %>%
+  mutate(median=median(Abundance)) %>%
+  arrange(desc(median))
+
+# select group median > 1
+keep2 <- unique(ps.melt2$Order[ps.melt2$median >=5])
+ps.melt2$Order[!(ps.melt2$Order %in% keep2)] <- "< %5 (Other)"
+
+#to get the same rows together
+ps.melt_sum2 <- ps.melt2 %>%
+  group_by(family,BiologicalMatter,host_genus,country_region,Order) %>%
+  summarize(Abundance = sum(Abundance), 
+            mean = sum(Abundance), .groups = "drop") %>%
+            mutate(Order= factor(Order),
+                   Order= fct_reorder(Order,mean, .desc = TRUE),
+                   Order= fct_shift(Order, n=-1))
+
+   
+#, .desc = TRUE 
+# Then Plot Results
+                  #theme(legend.key.size = unit(.9, 'cm')))  #title =expression(paste(italic(" Oribcella Spp."),"Microbial Community Composition Across Depth ")), + #
+plot(testp2)
+
+```
+
+# BAR PLOTS: Complex Coral
+```{r}
+complex_coral <-subset_samples(coral, complex_robust == "robust")
+
+## Bar Plots Across Family and biological compartment
+
+ps.all1 = transform_sample_counts(complex_coral, function(x) x/sum(x)*100)
+
+# agglomerate taxa
+glom1 <- tax_glom(ps.all1, taxrank = 'Family', NArm = TRUE)
+ps.melt_g1 <- psmelt(glom1)
+
+# change to character for easy-adjusted level
+ps.melt1 <- ps.melt_g1 %>%
+  group_by(family,BiologicalMatter,country_region,Family) %>%
+  mutate(median=median(Abundance)) %>%
+  arrange(desc(median))
+
+# select group median > 1
+keep1 <- unique(ps.melt1$Family[ps.melt1$median >10])
+ps.melt1$Family[!(ps.melt1$Family %in% keep1)] <- "< %1 (Other)"
+
+#to get the same rows together
+ps.melt_sum1 <- ps.melt1 %>%
+  group_by(family,BiologicalMatter,country_region,Family) %>%
+  summarize(Abundance = sum(Abundance), 
+            mean = sum(Abundance), .groups = "drop") %>%
+            mutate(Family= factor(Family),
+                   Family= fct_reorder(Family,mean, .desc = TRUE),
+                   Family= fct_shift(Family, n=1))
+
+   
+#, .desc = TRUE 
+# Then Plot Results
+many_col1 <- c("#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6", "#FFFF99", "#B15928","#1B9E77", "#D95F02", "#7570B3" ,"#666666", "#6A3D9A","#E7298A", "#66A61E", "#E6AB02", "#A6761D","#999999", "#E41A1C", "#377EB8", "#4DAF4A" ,"#984EA3", "#FF7F00", "#FFFF33", "#A65628", "#F781BF" ,"#D53E4F","#F46D43", "#FDAE61", "#FEE08B", "#E6F598","#ABDDA4","#3288BD","cyan1","#66C2A5")
+testp1 <-0
+testp1 <-ggplot(ps.melt_sum1, aes(x = family, y = Abundance, fill = Family)) + 
+  geom_bar(stat = "identity", position="fill")  +
+  labs( x=" family", y="Percent Relative Abundance (%)") +
+                  scale_fill_manual(name=NULL, values = c(many_col1)) + 
+                  facet_wrap(~country_region, scales= "free_x", nrow=1)+
+                  theme_classic() +   theme(axis.text.x = element_text(angle = -90) +   
+                  theme_classic()  +  theme(axis.text=element_text(size=12), axis.title=element_text(size=14,face="bold"), plot.title = element_text(size = 14, face = "bold",hjust = 0.5,),legend.text = element_text(size = 8), legend.box = "horizontal") + theme(legend.text = element_text(size=12))+
+                  theme(legend.key.size = unit(.9, 'cm')))  #title =expression(paste(italic(" Oribcella Spp."),"Microbial Community Composition Across Depth ")), + #
+plot(testp1)
+
+```
+
+# PERMANOVAs for Coral Compartments 
+## 1. Comparison between (Mucus, Tissue, Skeleton ~ family*country_region)
+```{r}
+#Tissue Subset
+
+
+distance_methods <-c("bray_tissue_complex","uni_tissue_complex","wuni_tissue_complex")
+set.seed(111)
+# This is what is called a for loop. I believe Kate touched on these when she gave her lecture. Try to break it down piece by piece: what is happening in the first line? The second line? The third?         
+for (i in distance_methods){ 
+  form <- as.formula(paste(i,"family*country", sep="~"))
+  print(form)
+ adonis2(form, data=com_tis_df)-> result
+ print(result)
+}
+
+distance_methods2 <-c("bray_skeleton_robust","uni_skeleton_robust","wuni_skeleton_robust")
+set.seed(111)
+# This is what is called a for loop. I believe Kate touched on these when she gave her lecture. Try to break it down piece by piece: what is happening in the first line? The second line? The third?         
+for (i in distance_methods2){ 
+  form2 <- as.formula(paste(i,"family*country", sep="~"))
+  print(form2)
+ adonis2(form2, data=rob_ske_df)-> result2
+ print(result2)
+}
+# Endo_complex_phlyo_tissue
+bray_endo_tis <- phyloseq::distance(rhodo_ske, method= "bray")
+uni_endo_tis <- phyloseq::distance(rhodo_ske, method= "unifrac")
+wuni_endo_tis <- phyloseq::distance(rhodo_ske, method= "WUnifrac")
+
+endo_tis_df <- data.frame(sample_data(rhodo_ske))
+bray_endo_tis[is.na(bray_endo_tis)] <- 0
+uni_endo_tis[is.na(uni_endo_tis)] <- 0
+wuni_endo_tis[is.na(wuni_endo_tis)] <- 0
+
+distance_methods3 <-c("bray_endo_tis","uni_endo_tis","wuni_endo_tis")
+set.seed(111)
+# This is what is called a for loop. I believe Kate touched on these when she gave her lecture. Try to break it down piece by piece: what is happening in the first line? The second line? The third?         
+for (i in distance_methods3){ 
+  form3 <- as.formula(paste(i,"family*country", sep="~"))
+  print(form3)
+ adonis2(form3, data=endo_tis_df)-> result3
+ print(result3)
+}
+
+```
+# Hclutering
+```{r}
+wuni_endo_ske[is.na(wuni_endo_ske)] <- 0
+
+# Clustering for: phylo_comp
+hc_complex_muc <- hclust(uni_skeleton_complex, method = "ward.D2")
+# Get label names 
+coral_family <- com_ske_df$family
+# Add tip labels
+hc_complex_muc$labels <- coral_family
+## Create the Dendrogram
+dend <- as.dendrogram(hc_complex_muc)
+
+#dend <- color_branches(dend, k=9)
+#plot(dend)
+
+##
+plot <-dend %>% set("leaves_pch", 15) %>% 
+  set("leaves_cex", 0.5) %>% # adjust the leave shape size
+  set("labels_cex",1.0) %>% # adjust the leave label size
+  color_branches(dend, k=4) %>%
+  set("labels_col", k=4) %>%
+  hang.dendrogram(hang_height = -0.002) %>% # hang level
+  plot(main = "GCMP Complex Clade Dendrogram \n UnWeighted Unifrac Distance with Skeleton samples",
+  horiz =  FALSE,  nodePar = list(cex = 0.01))
+
+
+```
+
+# Parking Lot
+```{r}
+## First, extract the top 100 ASVs
+phylo_top50 <- prune_taxa(names(sort(taxa_sums(pan_muc),TRUE)[1:100]), pan_muc)
+
+#phylo_noNA <- subset_taxa(ch_phylo, Phylum != "NA")
+write.table(otu_table(phylo_top50), file = "otu_ofrank.txt", sep = "\t",
+            row.names = TRUE)
+otu_table <- read.table("otu_ofrank.txt", sep="\t", header=T, row.names=1)
+otu_table.t <- t(otu_table)
+#Calculate the percentage for each taxa
+otus.perc <-otu_table.t/rowSums(otu_table.t)*100
+## Clean out an NA from the og dataset
+otus.perc_clean <- na.omit(otus.perc)
+
+# create colour scale for heatmap
+scaleyellowred <- colorRampPalette(c("lightyellow", "red"), space = "rgb")(100)
+
+# make most basic possible heatmap
+#quartz()
+heatmap(as.matrix(otus.perc_clean), Rowv = NA, Colv = NA, col = scaleyellowred)
+tis_matrix <- as.matrix(otus.perc_clean)
+# identify the maximum abundance of each OTU for a single sample
+maxab <- apply(otus.perc_clean, 2, max)
+
+# for the purpose of display, remove OTUs with less than 1% max abundance
+n1 <- names(which(maxab > 1))
+data.prop.1 <- otus.perc_clean[, -which(colnames(otus.perc_clean) %in% n1)]
+
+# Calculate inter-sample distance on overall dataset
+data.dist <- vegdist(otus.perc_clean, method = "bray")
+  
+
+
+# Average linkage clustering
+row.clus <- hclust(data.dist, "aver")
+
+# Calculate which OTUs occur together more often for dual clustering
+data.dist.g <- vegdist(t(otus.perc_clean), method = "bray")
+col.clus <- hclust(data.dist.g, "aver")
+
+# Plot only abundant OTUs, but clustering from whole dataset
+#quartz()
+heatmap(as.matrix(otus.perc_clean), Rowv = as.dendrogram(row.clus), Colv = as.dendrogram(col.clus), 
+        col = scaleyellowred, margins = c(10, 3))
+## Plot the heatmap
+plot_heatmap(phylo_top50, "Phylum")
+plot_heatmap(phylo_top50, "NMDS", "bray", "SampleType", "Family")
+# Let's create a smaller dataset based on a specific phylum. Here, I am choosing Proteobacteria.
+##phylo_prot <- subset_taxa(phylo_nolow, Phylum == "Proteobacteria")
+
+
+```
+## Parking LotAlpha Diversity BoxPlots Species
+```{r}
+###Once we have our sub_samples rarefied we can start with some diversity analysis  and visualization
+### Alpha Diversity ** you can make multiple diversity box plots by switch x for sample variables
+#1
+astr_diversity_compartment <- plot_richness(astr, x="biological_matter", title = "Astrocoeniidae Diversity Across compartment", color = "tissue_compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+#2
+meru_diversity_compartment <- plot_richness(complex, x="family", color = "family", title = "Merulinidae Diversity Across compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+#3
+mon_diversity_compartment <- plot_richness(mon, x="biological_matter", title = "Montastreidae Diversity Across compartment", color = "tissue_compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+#4
+muss_diversity_compartment <- plot_richness(muss, x="tissue_compartment", title = "Mussidae Diversity Across compartment", color = "tissue_compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+#5
+sidsp_diversity_compartment <- plot_richness(sidsp, x="biological_matter", title = "Siderastreidae Diversity Across compartment", color = "tissue_compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+#6
+porpor_diversity_compartment <- plot_richness(porpor, x="biological_matter", title = "Poritidae Diversity Across compartment", color = "tissue_compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+#7
+mea_diversity_compartment <- plot_richness(mea, x="biological_matter", title = "Meandrinidae Diversity Across compartment", color = "tissue_compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+#8
+agri_diversity_compartment <- plot_richness(agri, x="biological_matter", title = "Agariciidae Diversity Across compartment", color = "tissue_compartment", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+#9
+acrop_diversity_compartment <- plot_richness(acrop, x="host_name", title = "Acroporidae Diversity Across Species Tissue", color = "host_name", measures = c("Shannon","Observed"),)+
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x.bottom = element_text(angle = -90))
+
+```
+## Script Parkinglot
+```{r}
+## Parkinglot
+##Distance matrix for Vibrio tissue
+bray_vibrio_tis = phyloseq::distance(vibrio_tis, method="bray")
+uni_vibrio_tis = phyloseq::distance(vibrio_tis, method="unifrac")
+wuni_vibrio_tis = phyloseq::distance(vibrio_tis, method="wUnifrac")
+##Distance matrix for Vibrio skeleton
+bray_vibrio_ske = phyloseq::distance(vibrio_ske, method="bray")
+uni_vibrio_ske = phyloseq::distance(vibrio_ske, method="unifrac")
+wuni_vibrio_ske = phyloseq::distance(vibrio_ske, method="wUnifrac")
+
+##Distance matrix for Endozoicomonadaceae mucus
+bray_endo_muc = phyloseq::distance(endo_muc, method="bray")
+uni_endo_muc = phyloseq::distance(endo_muc, method="unifrac")
+wuni_endo_muc = phyloseq::distance(endo_muc, method="wUnifrac")
+
+##Distance matrix for Endozoicomonadaceae tissue
+bray_endo_tis = phyloseq::distance(endo_tis, method="bray")
+uni_endo_tis = phyloseq::distance(endo_tis, method="unifrac")
+wuni_endo_tis = phyloseq::distance(endo_tis, method="wUnifrac")
+
+
+##Distance matrix for Endozoicomonadaceae skeleton
+bray_endo_muc = phyloseq::distance(endo_muc, method="bray")
+uni_endo_tis = phyloseq::distance(endo_muc, method="unifrac")
+wuni_endo_ske = phyloseq::distance(endo_muc, method="wUnifrac")
+
+##Distance matrix for Rhodobacteraceae mucus
+bray_rhodo_muc = phyloseq::distance(rhodo_muc, method="bray")
+uni_rhodo_tis = phyloseq::distance(rhodo_muc, method="unifrac")
+wuni_rhodo_ske = phyloseq::distance(rhodo_muc, method="wUnifrac")
+
+##Distance matrix for Rhodobacteraceae tissue
+bray_rhodo_muc = phyloseq::distance(rhodo_muc, method="bray")
+uni_rhodo_tis = phyloseq::distance(rhodo_muc, method="unifrac")
+wuni_rhodo_ske = phyloseq::distance(rhodo_muc, method="wUnifrac")
+##Distance matrix for Rhodobacteraceae skeleton
+bray_rhodo_muc = phyloseq::distance(rhodo_muc, method="bray")
+uni_rhodo_tis = phyloseq::distance(rhodo_muc, method="unifrac")
+wuni_rhodo_ske = phyloseq::distance(rhodo_muc, method="wUnifrac")
+
+# Sub_sample within Complex Corals
+endo_muc <-subset_taxa(mucus_complex, Family == "Endozoicomonadaceae")
+endo_tis <-subset_taxa(tissue_complex, Family == "Endozoicomonadaceae")
+endo_ske <-subset_taxa(skeleton_complex, Family == "Endozoicomonadaceae")
+#Sub_sample within Complex Corals
+rhodo_muc <-subset_taxa(mucus_complex, Family == "Rhodobacteraceae")
+rhodo_tis <-subset_taxa(tissue_complex, Family == "Rhodobacteraceae")
+rhodo_ske <-subset_taxa(skeleton_complex, Family == "Rhodobacteraceae")
+
+# Sub_sample within Complex Corals
+vibrio_muc <-subset_taxa(mucus_complex, Family == "Vibrionaceae")
+vibrio_tis <-subset_taxa(tissue_complex, Family == "Vibrionaceae")
+vibrio_ske <-subset_taxa(skeleton_complex, Family == "Vibrionaceae")
+
+# Complex compartments
+endo_mus_df <- data.frame(sample_data(endo_muc))
+endo_tis_df <- data.frame(sample_data(endo_tis))
+endo_ske_df <- data.frame(sample_data(endo_ske))
+
+# Robust Compartment
+rhodo_mus_df <- data.frame(sample_data(rhodo_muc))
+rhodo_tis_df <- data.frame(sample_data(rhodo_tis))
+rhodo_ske_df <- data.frame(sample_data(rhodo_ske))
+
+#Phylo_comparisons
+vibrio_muc_df <- data.frame(sample_data(vibrio_muc))
+vibrio_tis_df <- data.frame(sample_data(vibrio_tis))
+vibrio_ske_df <- data.frame(sample_data(vibrio_ske))
+
+## Compartments
+#mucus <-subset_samples(main_coral,BiologicalMatter == "Coral Mucus")
+#Tissue Subset
+#tissue <-subset_samples(main_coral,BiologicalMatter == "Coral Tissue")
+#Skeleton Subset
+#skeleton <-subset_samples(main_coral,BiologicalMatter == "Coral Skeleton")
+##Distance matrix for complex_Family_Compartment
+bray_acro_muc = phyloseq::distance(acro_muc, method="bray")
+bray_acro_tis = phyloseq::distance(acro_tis, method="bray")
+bray_acro_ske = phyloseq::distance(acro_ske, method="bray")
+uni_acro_tis = phyloseq::distance(acro_tis, method="unifrac")
+
+##Distance matrix for complex_Family_Compartment
+bray_agra_muc = phyloseq::distance(agra_muc, method="bray")
+bray_agra_tis = phyloseq::distance(agra_tis, method="bray")
+bray_agra_ske = phyloseq::distance(agra_ske, method="bray")
+uni_agra_tis = phyloseq::distance(agra_tis, method="unifrac")
+
+##Distance matrix for Robust_Family_Compartment
+bray_meru_muc = phyloseq::distance(meru_muc, method="bray")
+bray_meru_tis = phyloseq::distance(meru_tis, method="bray")
+bray_meru_ske = phyloseq::distance(meru_ske, method="bray")
+uni_meru_tis = phyloseq::distance(meru_tis, method="unifrac")
+
+##Distance matrix for Robust_Family_Compartment
+bray_poci_muc = phyloseq::distance(poci_muc, method="bray")
+bray_poci_tis = phyloseq::distance(poci_tis, method="bray")
+bray_poci_ske = phyloseq::distance(poci_ske, method="bray")
+uni_poci_tis = phyloseq::distance(poci_tis, method="unifrac")
+
+
+#robust_group_mucus
+meru_muc <-subset_samples(mucus, family == "Merulinidae")
+poci_muc <-subset_samples(mucus,family == "Pocilloporidae")
+dipl_muc <-subset_samples(mucus,family == "Diploastreidae")
+#robust_group_tissue
+meru_tis <-subset_samples(tissue, family == "Merulinidae")
+poci_tis <-subset_samples(tissue,family == "Pocilloporidae")
+dipl_tis <-subset_samples(tissue,family == "Diploastreidae")
+#robust_group_skeleton
+meru_ske <-subset_samples(skeleton, family == "Merulinidae")
+poci_ske <-subset_samples(skeleton,family == "Pocilloporidae")
+dipl_ske <-subset_samples(skeleton,family == "Diploastreidae")
+
+#complex_group_mucus
+acro_muc <-subset_samples(mucus, family == "Acroporidae")
+por_muc <-subset_samples(mucus, family == "Poritidae")
+agra_muc <-subset_samples(mucus, family == "Agariciidae")
+#dendro <-subset_samples(main_coral,family == "Dendrophylliidae")
+
+#complex_group_tissue
+acro_tis <-subset_samples(tissue, family == "Acroporidae")
+por_tis <-subset_samples(tissue, family == "Poritidae")
+agra_tis <-subset_samples(tissue, family == "Agariciidae")
+#dendro <-subset_samples(main_coral,family == "Dendrophylliidae")
+
+#complex_group_skeleton
+acro_ske <-subset_samples(skeleton, family == "Acroporidae")
+por_ske <-subset_samples(skeleton, family == "Poritidae")
+agra_ske <-subset_samples(skeleton, family == "Agariciidae")
+#dendro <-subset_samples(main_coral,family == "Dendrophylliidae")
+## Endo for hclust
+endo_tis <-subset_taxa(tissue, Family == "Endozoicomonadaceae")
+endo_ske <-subset_taxa(skeleton, Family == "Endozoicomonadaceae")
+
+##Distance matrix for Endozoicomonadaceae tissue
+bray_endo_tis = phyloseq::distance(endo_tis, method="bray")
+uni_endo_tis = phyloseq::distance(endo_tis, method="unifrac")
+wuni_endo_tis = phyloseq::distance(endo_tis, method="wUnifrac")
+
+
+##Distance matrix for Endozoicomonadaceae skeleton
+bray_endo_ske = phyloseq::distance(endo_ske, method="bray")
+uni_endo_ske = phyloseq::distance(endo_ske, method="unifrac")
+wuni_endo_ske = phyloseq::distance(endo_ske, method="wUnifrac")
+
+# Complex compartments
+endo_tis_df <- data.frame(sample_data(endo_tis))
+endo_ske_df <- data.frame(sample_data(endo_ske))
+
+## Complex Mucus data Frame
+com_muc_df <- data.frame(sample_data(mucus_complex))
+com_tis_df <- data.frame(sample_data(tissue_complex))
+com_ske_df <- data.frame(sample_data(skeleton_complex))
+
+## robust Mucus data Frame
+rob_muc_df <- data.frame(sample_data(mucus_robust))
+rob_tis_df <- data.frame(sample_data(tissue_robust))
+rob_ske_df <- data.frame(sample_data(skeleton_robust))
+
+# Clade
+rob_df <- data.frame(sample_data(robust))
+com_df <- data.frame(sample_data(complex))
+
+#Robust Family 
+meru_df <- data.frame(sample_data(meru))
+lobo_df <- data.frame(sample_data(lobo))
+poci_df <- data.frame(sample_data(poci))
+dipl <- data.frame(sample_data(dipl))
+
+## Complex Family
+acro_df <- data.frame(sample_data(acro))
+por_df <- data.frame(sample_data(por))
+agra_df <- data.frame(sample_data(agra))
+dendro_df <- data.frame(sample_data(dendro))
+
+
+mon <-subset_samples(main_coral, family == "Montastreidae") ### Only tissue and samples from panama contain one sample set
+astr <-subset_samples(phylo_nclass, family == "Astrocoeniidae")
+sidsp <-subset_samples(phylo_nclass, family == "Siderastreidae")
+mea <-subset_samples(phylo_nclass, family == "Meandrinidae") 
+#tis_df$Mode.of.larval.development
+
+#carib <- subset_samples(main_coral, ocean == "Atlantic")
+#east_panama <-subset_samples(main_coral, expedition_number == "E2")
+#west_panama <-subset_samples(main_coral, expedition_number == "E11")
+#colombia <-subset_samples(main_coral, political_area == "Colombia")
+#australia <-subset_samples(main_coral, political_area == "Australia")
+#hawaii <-subset_samples(main_coral, political_area == "Hawaii, United States")
+#lobo <-subset_samples(main_coral,family == "Lobophylliidae")
+#muss <-subset_samples(main_coral, family == "Mussidae")
+
+a_my_comparisons <- list( c("Acroporidae", "Agariciidae"), c("Dendrophylliidae", "Poritidae"), c("Agariciidae", "Dendrophylliidae"),c("Agariciidae", "Poritidae"),c("Diploastreidae", "Lobophylliidae"), c("Merulinidae", "Diploastreidae"), c("Pollcilloporidae", "Merulinidae"),c("Merulinidae", "Pollcilloporidae"))
+```
